@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-orix-bg text-white antialiased;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center rounded-md px-4 py-2 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-orix-bg disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-orix-accent text-white hover:bg-blue-600 focus:ring-orix-accent;
+  }
+  .btn-danger {
+    @apply btn bg-orix-danger text-white hover:bg-red-700 focus:ring-orix-danger;
+  }
+  .input {
+    @apply w-full rounded-md bg-orix-surface border border-orix-border px-3 py-2 text-sm text-white placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-orix-accent;
+  }
+  .card {
+    @apply rounded-lg bg-orix-surface border border-orix-border shadow-lg;
+  }
+}

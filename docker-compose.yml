@@ -1,6 +1,6 @@
 x-common-env: &common-env
   env_file:
-    - .env
+    - ./backend/.env
 
 services:
   # ─── Infrastructure ─────────────────────────────────────────────────────────
@@ -13,7 +13,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-febrero13}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./backend/scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -47,7 +47,7 @@ services:
   # ─── FastAPI + Socket.IO API ─────────────────────────────────────────────────
   api:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile
     container_name: orix_api
     <<: *common-env
@@ -68,7 +68,7 @@ services:
   # ─── GPU Workers ─────────────────────────────────────────────────────────────
   worker:
     build:
-      context: .
+      context: ./backend
       dockerfile: Dockerfile.worker
     container_name: orix_worker
     <<: *common-env
@@ -81,7 +81,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-febrero13}@postgres:5432/${POSTGRES_DB:-ORIX_DB}
       REDIS_URL: redis://redis:6379/0
     volumes:
-      - ./models:/app/models:ro
+      - ./backend/models:/app/models:ro
     deploy:
       resources:
         reservations:
@@ -89,6 +89,20 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - orix_net
+
+  # ─── React Frontend (Nginx) ─────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: orix_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
     restart: unless-stopped
     networks:
       - orix_net

@@ -1,0 +1,16 @@
+# CODEOWNERS
+# Each line is a pattern followed by one or more owners.
+# Owners are automatically requested for review when someone opens a PR
+# that modifies matching files.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Global owner — fallback for everything not matched below
+* @Rosse01010
+
+# CI/CD and infrastructure
+.github/ @Rosse01010
+
+# Core configuration files
+package.json @Rosse01010
+vite.config.js @Rosse01010
+eslint.config.js @Rosse01010
