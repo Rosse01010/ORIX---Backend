@@ -8,7 +8,7 @@ services:
   # ─── Infrastructure ─────────────────────────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: facedb_postgres
+    container_name: orix_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ORIX_DB}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
@@ -24,10 +24,12 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks:
+      - orix_net
 
   redis:
     image: redis:7.2-alpine
-    container_name: facedb_redis
+    container_name: orix_redis
     command: >
       redis-server
       --maxmemory 512mb
@@ -41,13 +43,15 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks:
+      - orix_net
 
-  # ─── API Server ─────────────────────────────────────────────────────────────
+  # ─── FastAPI + Socket.IO API ─────────────────────────────────────────────────
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
-    container_name: facedb_api
+    container_name: orix_api
     <<: *common-env
     ports:
       - "${APP_PORT:-8000}:8000"
@@ -61,14 +65,14 @@ services:
       REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
     networks:
-      - face_net
+      - orix_net
 
-  # ─── GPU Worker ─────────────────────────────────────────────────────────────
+  # ─── GPU Workers ─────────────────────────────────────────────────────────────
   worker:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    container_name: facedb_worker
+    container_name: orix_worker
     <<: *common-env
     depends_on:
       postgres:
@@ -89,19 +93,28 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
     networks:
-      - face_net
+      - orix_net
 
-  # ─── Optional: Prometheus Metrics ───────────────────────────────────────────
-  # prometheus:
-  #   image: prom/prometheus:latest
-  #   volumes:
-  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
-  #   ports:
-  #     - "9090:9090"
+  # ─── React Frontend (Nginx) ──────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ..
+      dockerfile: ORIX---Backend/backend2/Dockerfile.frontend
+      args:
+        VITE_API_URL: http://localhost:8000
+        VITE_SOCKET_URL: http://localhost:8000
+    container_name: orix_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - orix_net
 
 volumes:
   postgres_data:
 
 networks:
-  face_net:
+  orix_net:
     driver: bridge
