@@ -27,7 +27,12 @@ from app.config import settings
 from app.database import get_db_dep
 from app.models import Person, PersonEmbedding
 
-router = APIRouter(prefix="/api", tags=["recognition"])
+router = APIRouter(prefix="/api/recognition", tags=["recognition"])
+
+
+@router.get("/health")
+async def recognition_health():
+    return {"status": "ok", "websocket_clients": 0}
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -292,3 +297,95 @@ async def delete_person(
     if not person:
         raise HTTPException(status_code=404, detail="Person not found.")
     person.active = False
+
+
+# ── Browser-based enrollment (face-api.js embedding) ─────────────────────────
+
+class BrowserEnrollPayload(BaseModel):
+    name: str
+    embedding: List[float]
+    linkedin_url: Optional[str] = None
+    instagram_handle: Optional[str] = None
+    twitter_handle: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class BrowserEnrollResponse(BaseModel):
+    person_id: str
+    name: str
+    linkedin_url: Optional[str] = None
+    instagram_handle: Optional[str] = None
+    twitter_handle: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.post("/persons/enroll", response_model=BrowserEnrollResponse, status_code=status.HTTP_201_CREATED)
+async def enroll_person_browser(
+    payload: BrowserEnrollPayload,
+    db: AsyncSession = Depends(get_db_dep),
+) -> BrowserEnrollResponse:
+    """
+    Register a person using a pre-computed face embedding from the browser
+    (face-api.js). Accepts optional social-profile links provided by the
+    person at enrollment time.
+    """
+    import json as _json
+
+    person = Person(
+        name=payload.name,
+        linkedin_url=payload.linkedin_url,
+        instagram_handle=payload.instagram_handle,
+        twitter_handle=payload.twitter_handle,
+        notes=payload.notes,
+    )
+    db.add(person)
+    await db.flush()
+
+    db.add(PersonEmbedding(
+        person_id=person.id,
+        embedding_vec=_json.dumps(payload.embedding),
+        angle_hint="frontal",
+        quality_score=1.0,
+    ))
+    await db.flush()
+
+    return BrowserEnrollResponse(
+        person_id=str(person.id),
+        name=person.name,
+        linkedin_url=person.linkedin_url,
+        instagram_handle=person.instagram_handle,
+        twitter_handle=person.twitter_handle,
+        notes=person.notes,
+    )
+
+
+class PersonDetailOut(BaseModel):
+    id: str
+    name: str
+    linkedin_url: Optional[str] = None
+    instagram_handle: Optional[str] = None
+    twitter_handle: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: str
+
+
+@router.get("/persons/{person_id}", response_model=PersonDetailOut)
+async def get_person(
+    person_id: str,
+    db: AsyncSession = Depends(get_db_dep),
+) -> PersonDetailOut:
+    result = await db.execute(
+        select(Person).where(Person.id == uuid.UUID(person_id), Person.active == True)
+    )
+    person = result.scalar_one_or_none()
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found.")
+    return PersonDetailOut(
+        id=str(person.id),
+        name=person.name,
+        linkedin_url=person.linkedin_url,
+        instagram_handle=person.instagram_handle,
+        twitter_handle=person.twitter_handle,
+        notes=person.notes,
+        created_at=person.created_at.isoformat(),
+    )
