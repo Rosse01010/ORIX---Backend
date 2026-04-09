@@ -89,6 +89,12 @@ async def init_db() -> None:
     # Import models AFTER deciding PGVECTOR_AVAILABLE
     from app import models  # noqa: F401
 
+    # Conditionally import OSINT models so the audit table gets created
+    from app.config import settings as _cfg
+    if _cfg.osint_enabled:
+        from app.osint.core import models as _osint_models  # noqa: F401
+        log.info("OSINT audit log table registered")
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

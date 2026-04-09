@@ -101,6 +101,13 @@ class Settings(BaseSettings):
     def onnx_provider_list(self) -> List[str]:
         return [p.strip() for p in self.onnx_providers.split(",") if p.strip()]
 
+    # ── OSINT (disabled by default) ──────────────────────────────────────────
+    osint_enabled: bool = False
+    osint_cache_ttl_seconds: int = 3600       # Redis cache TTL for OSINT results
+    osint_max_providers: int = 10             # max concurrent provider queries
+    osint_default_top_k: int = 10
+    osint_local_dataset_dir: str = "/app/datasets"
+
     # ── Workers ────────────────────────────────────────────────────────────────
     gpu_worker_batch_size: int = 4
     gpu_worker_timeout_ms: int = 100

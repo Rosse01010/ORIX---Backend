@@ -96,6 +96,34 @@ services:
     networks:
       - orix_net
 
+  # ─── OSINT Service (optional, CPU only) ──────────────────────────────────────
+  # Disabled by default. Enable with: docker compose --profile osint up
+  osint-service:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: orix_osint
+    <<: *common-env
+    profiles:
+      - osint
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-febrero13}@postgres:5432/${POSTGRES_DB:-ORIX_DB}
+      REDIS_URL: redis://redis:6379/0
+      OSINT_ENABLED: "true"
+      USE_GPU: "false"
+    ports:
+      - "${OSINT_PORT:-8001}:8000"
+    restart: unless-stopped
+    networks:
+      - orix_net
+
   # ─── React Frontend (Nginx) ─────────────────────────────────────────────────
   frontend:
     build:

@@ -100,6 +100,12 @@ app.include_router(cameras_router.router)
 app.include_router(users_router.router)
 app.include_router(candidates_router.router)
 
+# ── OSINT subsystem (conditionally loaded) ────────────────────────────────────
+if settings.osint_enabled:
+    from app.osint.api.routes import router as osint_router
+    app.include_router(osint_router)
+    log.info("osint_subsystem_enabled")
+
 
 # ── Legacy native WebSocket (kept for backward compat) ─────────────────────────
 @app.websocket("/ws/detections")
