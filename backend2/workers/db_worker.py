@@ -1,18 +1,18 @@
 """
 db_worker.py
 ────────────
-Consumes embedding vectors from `stream:vectors`, searches pgvector for the
-nearest known face, writes detection logs to PostgreSQL, and publishes the
-final recognition event to `stream:events` (consumed by the WS relay).
+Consumes vectors from stream:vectors, searches pgvector across ALL embeddings
+of ALL persons (grouped by person), picks the best match per face,
+logs detections, and publishes the final event to stream:events.
 
-Final event format (published to stream:events as JSON under key "payload"):
-{
-    "camera": "cam_01",
-    "timestamp": "2026-04-08T12:00:00+00:00",
-    "bboxes": [
-        {"x": 120, "y": 60, "width": 100, "height": 100, "name": "Carlos", "confidence": 0.87}
-    ]
-}
+Multi-embedding search strategy:
+  SELECT person_id, name, MAX(1 - embedding <=> query) AS best_similarity
+  FROM person_embeddings JOIN persons USING(person_id)
+  GROUP BY person_id, name
+  ORDER BY best_similarity DESC LIMIT 1
+
+This means even if only one of a person's 5 embeddings matches well at
+an odd angle, the person is still correctly identified.
 """
 from __future__ import annotations
 
@@ -42,8 +42,8 @@ _running = True
 
 def _shutdown(sig, frame):
     global _running
-    log.info("db_worker_shutdown_requested")
     _running = False
+    log.info("db_worker_shutdown")
 
 
 signal.signal(signal.SIGTERM, _shutdown)
@@ -59,29 +59,43 @@ def _ensure_group(rc: redis.Redis, stream: str) -> None:
 
 
 def _sync_db_url(url: str) -> str:
-    """Convert asyncpg URL to psycopg2 for sync worker."""
     return url.replace("postgresql+asyncpg://", "postgresql://")
 
 
-def _vec_to_pg(embedding: List[float]) -> str:
+def _vec_pg(embedding: List[float]) -> str:
     return "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
 
 
 def _search_person(
     conn, embedding: List[float]
 ) -> Tuple[Optional[str], Optional[str], float]:
-    """Returns (person_id, name, similarity)."""
-    vec_str = _vec_to_pg(embedding)
-    result = conn.execute(
-        text(
-            "SELECT id::text, name, 1 - (embedding <=> :vec::vector) AS similarity "
-            "FROM persons WHERE active = true "
-            "ORDER BY embedding <=> :vec::vector LIMIT 1"
-        ),
+    """
+    Find the best-matching person by searching ALL their embeddings.
+
+    Uses MAX() cosine similarity across every embedding for each person,
+    so any registered angle can trigger a match.
+
+    Returns (person_id, name, similarity) or (None, "Unknown", 0.0).
+    """
+    vec_str = _vec_pg(embedding)
+    row = conn.execute(
+        text("""
+            SELECT
+                p.id::text        AS person_id,
+                p.name            AS name,
+                MAX(1 - (pe.embedding <=> :vec::vector)) AS best_sim
+            FROM person_embeddings pe
+            JOIN persons p ON p.id = pe.person_id
+            WHERE p.active = true
+            GROUP BY p.id, p.name
+            ORDER BY best_sim DESC
+            LIMIT 1
+        """),
         {"vec": vec_str},
     ).first()
-    if result and result.similarity >= settings.similarity_threshold:
-        return result.id, result.name, float(result.similarity)
+
+    if row and row.best_sim >= settings.similarity_threshold:
+        return row.person_id, row.name, float(row.best_sim)
     return None, "Unknown", 0.0
 
 
@@ -90,23 +104,35 @@ def _log_detection(
     person_id: Optional[str],
     camera_id: str,
     confidence: float,
+    quality: float,
     bbox: List[int],
+    yaw: float,
+    pitch: float,
+    roll: float,
     timestamp: str,
 ) -> None:
     conn.execute(
-        text(
-            "INSERT INTO detection_logs "
-            "(id, person_id, camera_id, confidence, bbox_x, bbox_y, bbox_w, bbox_h, detected_at) "
-            "VALUES (gen_random_uuid(), :pid::uuid, :cam, :conf, :x, :y, :w, :h, :ts::timestamptz)"
-        ),
+        text("""
+            INSERT INTO detection_logs
+              (id, person_id, camera_id, confidence, quality_score,
+               pitch, yaw, roll,
+               bbox_x, bbox_y, bbox_w, bbox_h, detected_at)
+            VALUES
+              (gen_random_uuid(),
+               :pid::uuid, :cam, :conf, :qual,
+               :pitch, :yaw, :roll,
+               :x, :y, :w, :h,
+               :ts::timestamptz)
+        """),
         {
             "pid": person_id,
             "cam": camera_id,
             "conf": confidence,
-            "x": bbox[0],
-            "y": bbox[1],
-            "w": bbox[2],
-            "h": bbox[3],
+            "qual": quality,
+            "pitch": pitch,
+            "yaw": yaw,
+            "roll": roll,
+            "x": bbox[0], "y": bbox[1], "w": bbox[2], "h": bbox[3],
             "ts": timestamp,
         },
     )
@@ -122,7 +148,6 @@ def run() -> None:
 
     _ensure_group(rc, in_stream)
 
-    # Sync SQLAlchemy engine (workers are synchronous processes)
     engine = sqlalchemy.create_engine(
         _sync_db_url(settings.database_url),
         pool_size=5,
@@ -135,8 +160,7 @@ def run() -> None:
     while _running:
         try:
             results = rc.xreadgroup(
-                CONSUMER_GROUP,
-                CONSUMER_NAME,
+                CONSUMER_GROUP, CONSUMER_NAME,
                 {in_stream: ">"},
                 count=batch_size,
                 block=500,
@@ -145,9 +169,9 @@ def run() -> None:
                 continue
 
             with engine.begin() as conn:
-                for _stream, messages in results:
+                for _stream_name, messages in results:
                     for msg_id, fields in messages:
-                        _process_message(rc, conn, out_stream, in_stream, msg_id, fields)
+                        _process(rc, conn, out_stream, in_stream, msg_id, fields)
 
         except redis.ConnectionError:
             log.warning("db_worker_redis_reconnect")
@@ -162,7 +186,7 @@ def run() -> None:
     log.info("db_worker_stopped")
 
 
-def _process_message(
+def _process(
     rc: redis.Redis,
     conn,
     out_stream: str,
@@ -179,25 +203,34 @@ def _process_message(
         bboxes: List[Dict[str, Any]] = []
 
         for face in faces:
-            bbox = face["bbox"]          # [x, y, w, h]
+            bbox = face["bbox"]
             embedding = face["embedding"]
+            quality = face.get("quality", 1.0)
+            yaw = face.get("yaw", 0.0)
+            pitch = face.get("pitch", 0.0)
+            roll = face.get("roll", 0.0)
             det_score = face.get("det_score", 1.0)
+            angle_hint = face.get("angle_hint", "frontal")
 
             person_id, name, similarity = _search_person(conn, embedding)
             confidence = similarity if name != "Unknown" else det_score
 
-            _log_detection(conn, person_id, camera_id, confidence, bbox, timestamp)
-
-            bboxes.append(
-                {
-                    "x": int(bbox[0]),
-                    "y": int(bbox[1]),
-                    "width": int(bbox[2]),
-                    "height": int(bbox[3]),
-                    "name": name,
-                    "confidence": round(confidence, 4),
-                }
+            _log_detection(
+                conn, person_id, camera_id,
+                confidence, quality, bbox,
+                yaw, pitch, roll, timestamp,
             )
+
+            bboxes.append({
+                "x": int(bbox[0]),
+                "y": int(bbox[1]),
+                "width": int(bbox[2]),
+                "height": int(bbox[3]),
+                "name": name,
+                "confidence": round(confidence, 4),
+                "quality": round(quality, 3),
+                "angle": angle_hint,
+            })
 
         if bboxes:
             event_payload = {
@@ -211,7 +244,11 @@ def _process_message(
                 maxlen=settings.stream_max_len,
                 approximate=True,
             )
-            log.debug("db_worker_event_published", camera_id=camera_id, faces=len(bboxes))
+            log.debug(
+                "db_worker_event_published",
+                camera_id=camera_id,
+                faces=len(bboxes),
+            )
 
     except Exception as exc:
         log.warning("db_worker_msg_error", msg_id=msg_id, error=str(exc))

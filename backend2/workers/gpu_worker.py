@@ -1,18 +1,15 @@
 """
 gpu_worker.py
 ─────────────
-Consumes frames from `stream:frames`, runs face detection + embedding on GPU,
-publishes embedding vectors + bounding boxes to `stream:vectors`.
+Consumes frames from stream:frames, runs:
+  1. SCRFD-10G face detection (handles 100+ faces in crowds)
+  2. 5-point landmark alignment
+  3. Face quality scoring (sharpness + pose + size + det_score)
+  4. ArcFace R100 embedding generation
+  5. Publishes results to stream:vectors
 
-Each output message on stream:vectors:
-  camera_id  – source camera
-  timestamp  – original frame timestamp
-  faces_json – JSON list of {bbox, embedding, det_score}
-
-Architecture:
-  • Uses InsightFace (RetinaFace detector + ArcFace embedder) by default.
-  • Falls back to MediaPipe (CPU) if GPU is unavailable.
-  • Batches up to GPU_WORKER_BATCH_SIZE frames per loop iteration.
+Only faces above MIN_QUALITY_SCORE are embedded to avoid wasting DB lookups
+on blurry, occluded, or extreme-angle faces.
 """
 from __future__ import annotations
 
@@ -31,21 +28,25 @@ import redis
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import settings
+from utils.face_quality import composite_quality, angle_hint_from_yaw
 from utils.gpu_utils import build_detector, build_embedder
 from utils.logging_utils import configure_logging, get_logger
 
 log = get_logger(__name__)
 
 CONSUMER_GROUP = "gpu_workers"
-CONSUMER_NAME = f"gpu_worker_0"
+CONSUMER_NAME = "gpu_worker_0"
+
+# Minimum composite quality to bother embedding a face
+MIN_QUALITY_SCORE = 0.15
 
 _running = True
 
 
 def _shutdown(sig, frame):
     global _running
-    log.info("gpu_worker_shutdown_requested")
     _running = False
+    log.info("gpu_worker_shutdown")
 
 
 signal.signal(signal.SIGTERM, _shutdown)
@@ -68,7 +69,7 @@ def _ensure_group(rc: redis.Redis, stream: str) -> None:
 
 def run() -> None:
     configure_logging(settings.worker_log_level)
-    log.info("gpu_worker_start", backend=settings.detector_backend, gpu=settings.use_gpu)
+    log.info("gpu_worker_start", backend=settings.detector_backend)
 
     rc = redis.from_url(settings.redis_url, decode_responses=True)
     in_stream = settings.stream_frames
@@ -77,8 +78,8 @@ def run() -> None:
     _ensure_group(rc, in_stream)
 
     detector = build_detector()
-    embedder = build_embedder()
-    log.info("models_loaded", detector=type(detector).__name__, embedder=type(embedder).__name__)
+    embedder = build_embedder(detector)
+    log.info("models_ready")
 
     batch_size = settings.gpu_worker_batch_size
     timeout_ms = settings.gpu_worker_timeout_ms
@@ -86,8 +87,7 @@ def run() -> None:
     while _running:
         try:
             results = rc.xreadgroup(
-                CONSUMER_GROUP,
-                CONSUMER_NAME,
+                CONSUMER_GROUP, CONSUMER_NAME,
                 {in_stream: ">"},
                 count=batch_size,
                 block=timeout_ms,
@@ -95,9 +95,9 @@ def run() -> None:
             if not results:
                 continue
 
-            for _stream, messages in results:
+            for _stream_name, messages in results:
                 for msg_id, fields in messages:
-                    _process_message(rc, out_stream, msg_id, fields, in_stream, detector, embedder)
+                    _process(rc, out_stream, in_stream, msg_id, fields, detector, embedder)
 
         except redis.ConnectionError:
             log.warning("gpu_worker_redis_reconnect")
@@ -109,12 +109,12 @@ def run() -> None:
     log.info("gpu_worker_stopped")
 
 
-def _process_message(
+def _process(
     rc: redis.Redis,
     out_stream: str,
+    in_stream: str,
     msg_id: str,
     fields: Dict[str, Any],
-    in_stream: str,
     detector,
     embedder,
 ) -> None:
@@ -127,19 +127,42 @@ def _process_message(
         faces = detector.detect(frame)
 
         faces_data: List[Dict[str, Any]] = []
+
         for face in faces:
+            # ── Quality gate ────────────────────────────────────────
+            w, h = face.bbox[2], face.bbox[3]
+            if w < settings.min_face_size or h < settings.min_face_size:
+                continue
             if face.det_score < settings.detection_confidence:
                 continue
-            if face.bbox[2] < settings.min_face_size or face.bbox[3] < settings.min_face_size:
-                continue
-            embedding = embedder.embed(face.crop)
-            faces_data.append(
-                {
-                    "bbox": face.bbox,          # [x, y, w, h]
-                    "embedding": embedding,      # list[float] len=512
-                    "det_score": float(face.det_score),
-                }
+
+            quality, yaw, pitch, roll, pose_sc = composite_quality(
+                face.crop, face.kps, w, h, face.det_score
             )
+
+            if quality < MIN_QUALITY_SCORE:
+                log.debug(
+                    "face_skipped_low_quality",
+                    camera_id=camera_id,
+                    quality=round(quality, 3),
+                    yaw=round(yaw, 1),
+                )
+                continue
+
+            # ── Embed ───────────────────────────────────────────────
+            embedding = embedder.embed(face.crop)
+            angle_hint = angle_hint_from_yaw(yaw)
+
+            faces_data.append({
+                "bbox": face.bbox,
+                "embedding": embedding,
+                "det_score": float(face.det_score),
+                "quality": float(quality),
+                "yaw": float(yaw),
+                "pitch": float(pitch),
+                "roll": float(roll),
+                "angle_hint": angle_hint,
+            })
 
         if faces_data:
             rc.xadd(
@@ -152,7 +175,11 @@ def _process_message(
                 maxlen=settings.stream_max_len,
                 approximate=True,
             )
-            log.debug("gpu_worker_processed", camera_id=camera_id, faces=len(faces_data))
+            log.debug(
+                "gpu_worker_processed",
+                camera_id=camera_id,
+                faces=len(faces_data),
+            )
 
     except Exception as exc:
         log.warning("gpu_worker_frame_error", msg_id=msg_id, error=str(exc))

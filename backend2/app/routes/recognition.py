@@ -1,10 +1,13 @@
 """
-REST endpoints for facial recognition.
+recognition.py
+──────────────
+REST endpoints for facial recognition and person management.
 
-POST /recognize  – synchronous recognition on an uploaded image.
-GET  /persons    – list all known persons.
-POST /persons    – register a new person + embedding.
-DELETE /persons/{id} – remove a person.
+POST /api/recognize           – recognize faces in an uploaded image
+GET  /api/persons             – list all known persons
+POST /api/persons             – register person with one or more photos
+POST /api/persons/{id}/photos – add more photos (angles) to existing person
+DELETE /api/persons/{id}      – soft-delete person
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db_dep
-from app.models import Person
+from app.models import Person, PersonEmbedding
 
 router = APIRouter(prefix="/api", tags=["recognition"])
 
@@ -36,6 +39,8 @@ class BBox(BaseModel):
     height: int
     name: str
     confidence: float
+    quality: float = 0.0
+    angle: str = "frontal"
 
 
 class RecognitionResponse(BaseModel):
@@ -48,11 +53,8 @@ class PersonOut(BaseModel):
     id: str
     name: str
     active: bool
+    embedding_count: int
     created_at: str
-
-
-class PersonCreate(BaseModel):
-    name: str
 
 
 # ── Lazy model loader ──────────────────────────────────────────────────────────
@@ -66,8 +68,39 @@ def _get_models():
     if _detector is None:
         from utils.gpu_utils import build_detector, build_embedder
         _detector = build_detector()
-        _embedder = build_embedder()
+        _embedder = build_embedder(_detector)
     return _detector, _embedder
+
+
+# ── Multi-embedding search ─────────────────────────────────────────────────────
+
+async def _search_person(
+    db: AsyncSession, embedding: List[float]
+) -> tuple[Optional[str], str, float]:
+    """
+    Search across ALL embeddings for ALL persons.
+    Returns the person with the highest cosine similarity match.
+    """
+    vec_str = "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
+    result = await db.execute(
+        text("""
+            SELECT
+                p.id::text   AS person_id,
+                p.name       AS name,
+                MAX(1 - (pe.embedding <=> :vec::vector)) AS best_sim
+            FROM person_embeddings pe
+            JOIN persons p ON p.id = pe.person_id
+            WHERE p.active = true
+            GROUP BY p.id, p.name
+            ORDER BY best_sim DESC
+            LIMIT 1
+        """),
+        {"vec": vec_str},
+    )
+    row = result.first()
+    if row and row.best_sim >= settings.similarity_threshold:
+        return row.person_id, row.name, float(row.best_sim)
+    return None, "Unknown", 0.0
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -78,23 +111,43 @@ async def recognize_image(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db_dep),
 ) -> RecognitionResponse:
-    """Run face detection + recognition on a single uploaded image."""
+    """Synchronous recognition on a single uploaded image."""
+    from utils.face_quality import composite_quality, angle_hint_from_yaw
+    from utils.preprocessing import preprocess_frame
+
     contents = await file.read()
     img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    # Convert RGB → BGR for OpenCV pipeline
+    import cv2
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    img_bgr = preprocess_frame(
+        img_bgr,
+        settings.camera_resize_width,
+        settings.camera_resize_height,
+    )
 
     detector, embedder = _get_models()
-
-    from utils.preprocessing import preprocess_frame
-    img = preprocess_frame(img, settings.camera_resize_width, settings.camera_resize_height)
-
-    faces = detector.detect(img)
+    faces = detector.detect(img_bgr)
     bboxes: List[BBox] = []
 
     for face in faces:
+        w, h = face.bbox[2], face.bbox[3]
+        quality, yaw, pitch, roll, _ = composite_quality(
+            face.crop, face.kps, w, h, face.det_score
+        )
+        if quality < 0.1:
+            continue
         embedding = embedder.embed(face.crop)
-        name, confidence = await _search_person(db, embedding)
-        x, y, w, h = face.bbox
-        bboxes.append(BBox(x=x, y=y, width=w, height=h, name=name, confidence=round(confidence, 4)))
+        _, name, confidence = await _search_person(db, embedding)
+        angle = angle_hint_from_yaw(yaw)
+        x, y = face.bbox[0], face.bbox[1]
+        bboxes.append(BBox(
+            x=x, y=y, width=w, height=h,
+            name=name,
+            confidence=round(confidence, 4),
+            quality=round(quality, 3),
+            angle=angle,
+        ))
 
     return RecognitionResponse(
         camera=camera,
@@ -103,71 +156,143 @@ async def recognize_image(
     )
 
 
-async def _search_person(
-    db: AsyncSession, embedding: List[float]
-) -> tuple[str, float]:
-    """Find nearest neighbor in pgvector, return (name, cosine_similarity)."""
-    vec_str = "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
-    result = await db.execute(
-        text(
-            "SELECT name, 1 - (embedding <=> :vec::vector) AS similarity "
-            "FROM persons WHERE active = true "
-            "ORDER BY embedding <=> :vec::vector LIMIT 1"
-        ),
-        {"vec": vec_str},
-    )
-    row = result.first()
-    if row and row.similarity >= settings.similarity_threshold:
-        return row.name, float(row.similarity)
-    return "Unknown", 0.0
-
-
 @router.get("/persons", response_model=List[PersonOut])
 async def list_persons(
     db: AsyncSession = Depends(get_db_dep),
 ) -> List[PersonOut]:
-    result = await db.execute(select(Person).where(Person.active == True))
+    result = await db.execute(
+        select(Person).where(Person.active == True)
+    )
     persons = result.scalars().all()
-    return [
-        PersonOut(
+    out = []
+    for p in persons:
+        count_r = await db.execute(
+            text("SELECT COUNT(*) FROM person_embeddings WHERE person_id = :pid"),
+            {"pid": str(p.id)},
+        )
+        count = count_r.scalar() or 0
+        out.append(PersonOut(
             id=str(p.id),
             name=p.name,
             active=p.active,
+            embedding_count=count,
             created_at=p.created_at.isoformat(),
-        )
-        for p in persons
-    ]
+        ))
+    return out
 
 
 @router.post("/persons", response_model=PersonOut, status_code=status.HTTP_201_CREATED)
 async def register_person(
     name: str = Form(...),
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),   # accept multiple photos at once
     db: AsyncSession = Depends(get_db_dep),
 ) -> PersonOut:
-    """Register a person by uploading their reference photo."""
-    contents = await file.read()
-    img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+    """
+    Register a person with one or more photos.
+    Send multiple photos at different angles for best recognition.
+    """
+    from utils.face_quality import composite_quality, angle_hint_from_yaw
+    import cv2
 
     detector, embedder = _get_models()
-    faces = detector.detect(img)
-    if not faces:
-        raise HTTPException(status_code=422, detail="No face detected in the image.")
 
-    # Use the largest face
-    face = max(faces, key=lambda f: f.bbox[2] * f.bbox[3])
-    embedding = embedder.embed(face.crop)
-
-    person = Person(name=name, embedding=embedding)
+    # Create person record first
+    person = Person(name=name)
     db.add(person)
+    await db.flush()
+
+    embeddings_added = 0
+
+    for upload in files:
+        contents = await upload.read()
+        img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        faces = detector.detect(img_bgr)
+        if not faces:
+            continue
+
+        # Use the largest face in each photo
+        face = max(faces, key=lambda f: f.bbox[2] * f.bbox[3])
+        w, h = face.bbox[2], face.bbox[3]
+        quality, yaw, pitch, roll, _ = composite_quality(
+            face.crop, face.kps, w, h, face.det_score
+        )
+        angle_hint = angle_hint_from_yaw(yaw)
+        embedding = embedder.embed(face.crop)
+
+        db.add(PersonEmbedding(
+            person_id=person.id,
+            embedding=embedding,
+            angle_hint=angle_hint,
+            quality_score=quality,
+        ))
+        embeddings_added += 1
+
+    if embeddings_added == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="No face detected in any of the uploaded images.",
+        )
+
     await db.flush()
 
     return PersonOut(
         id=str(person.id),
         name=person.name,
         active=person.active,
+        embedding_count=embeddings_added,
         created_at=person.created_at.isoformat(),
     )
+
+
+@router.post("/persons/{person_id}/photos", response_model=Dict[str, Any])
+async def add_photos(
+    person_id: str,
+    files: List[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db_dep),
+) -> Dict[str, Any]:
+    """Add more photos (angles) to an existing person to improve recognition."""
+    from utils.face_quality import composite_quality, angle_hint_from_yaw
+    import cv2
+
+    result = await db.execute(
+        select(Person).where(Person.id == uuid.UUID(person_id), Person.active == True)
+    )
+    person = result.scalar_one_or_none()
+    if not person:
+        raise HTTPException(status_code=404, detail="Person not found.")
+
+    detector, embedder = _get_models()
+    added = 0
+
+    for upload in files:
+        contents = await upload.read()
+        img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+        faces = detector.detect(img_bgr)
+        if not faces:
+            continue
+
+        face = max(faces, key=lambda f: f.bbox[2] * f.bbox[3])
+        w, h = face.bbox[2], face.bbox[3]
+        quality, yaw, pitch, roll, _ = composite_quality(
+            face.crop, face.kps, w, h, face.det_score
+        )
+        angle_hint = angle_hint_from_yaw(yaw)
+        embedding = embedder.embed(face.crop)
+
+        db.add(PersonEmbedding(
+            person_id=person.id,
+            embedding=embedding,
+            angle_hint=angle_hint,
+            quality_score=quality,
+        ))
+        added += 1
+
+    await db.flush()
+    return {"person_id": person_id, "photos_added": added}
 
 
 @router.delete("/persons/{person_id}", status_code=status.HTTP_204_NO_CONTENT)

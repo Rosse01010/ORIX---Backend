@@ -51,12 +51,17 @@ class Settings(BaseSettings):
     detector_backend: str = "insightface"   # insightface | mediapipe
     embedder_backend: str = "arcface"       # arcface | facenet
     model_dir: str = "/app/models"
+    # buffalo_l = SCRFD-10G detector + ArcFace R100 (best accuracy)
+    # buffalo_m = SCRFD-5G + ArcFace R50 (balanced)
+    # buffalo_s = SCRFD-500M + MBF (fastest)
     insightface_model: str = "buffalo_l"
 
     # ── Recognition ────────────────────────────────────────────────────────────
-    similarity_threshold: float = 0.45
-    min_face_size: int = 20
-    detection_confidence: float = 0.85
+    # Lower threshold = more permissive (catches more angles but more false positives)
+    # 0.35 works well for multi-angle; 0.50 for high-security frontal-only
+    similarity_threshold: float = 0.35
+    min_face_size: int = 20          # pixels — smaller = more crowd detections
+    detection_confidence: float = 0.50  # lower for crowds / partial occlusion
 
     # ── GPU ────────────────────────────────────────────────────────────────────
     gpu_device_id: int = 0
