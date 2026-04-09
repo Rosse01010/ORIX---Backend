@@ -22,7 +22,7 @@ from app.models import OrixUser
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # ── Crypto ─────────────────────────────────────────────────────────────────────
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd_ctx = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24

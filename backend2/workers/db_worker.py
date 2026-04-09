@@ -62,57 +62,17 @@ def _sync_db_url(url: str) -> str:
     return url.replace("postgresql+asyncpg://", "postgresql://")
 
 
-def _vec_pg(embedding: List[float]) -> str:
-    return "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
-
-
 def _search_best(conn, embedding: List[float]) -> Tuple[Optional[str], str, float]:
-    """Best single match across all embeddings, grouped by person."""
-    vec_str = _vec_pg(embedding)
-    row = conn.execute(
-        text("""
-            SELECT p.id::text AS pid, p.name,
-                   MAX(1 - (pe.embedding <=> :vec::vector)) AS best_sim
-            FROM person_embeddings pe
-            JOIN persons p ON p.id = pe.person_id
-            WHERE p.active = true
-            GROUP BY p.id, p.name
-            ORDER BY best_sim DESC
-            LIMIT 1
-        """),
-        {"vec": vec_str},
-    ).first()
-
-    if row and row.best_sim >= settings.similarity_threshold:
-        return row.pid, row.name, float(row.best_sim)
-    return None, "Unknown", 0.0
+    """Best single match across all embeddings using numpy cosine similarity."""
+    from utils.vector_search import search_best_sync
+    return search_best_sync(conn, embedding, settings.similarity_threshold,
+                            MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
 
 
 def _search_candidates(conn, embedding: List[float]) -> List[Dict[str, Any]]:
-    """
-    Return top-K persons sorted by best cosine similarity.
-    Used for the similarity panel when face is ambiguous or off-angle.
-    """
-    vec_str = _vec_pg(embedding)
-    rows = conn.execute(
-        text("""
-            SELECT p.id::text AS pid, p.name,
-                   MAX(1 - (pe.embedding <=> :vec::vector)) AS best_sim
-            FROM person_embeddings pe
-            JOIN persons p ON p.id = pe.person_id
-            WHERE p.active = true
-            GROUP BY p.id, p.name
-            HAVING MAX(1 - (pe.embedding <=> :vec::vector)) >= :min_sim
-            ORDER BY best_sim DESC
-            LIMIT :k
-        """),
-        {"vec": vec_str, "min_sim": MIN_CANDIDATE_SIM, "k": TOP_K_CANDIDATES},
-    ).fetchall()
-
-    return [
-        {"person_id": r.pid, "name": r.name, "similarity": round(float(r.best_sim), 4)}
-        for r in rows
-    ]
+    """Top-K candidate persons for the similarity panel."""
+    from utils.vector_search import search_candidates_sync
+    return search_candidates_sync(conn, embedding, MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
 
 
 def _log_detection(conn, person_id, camera_id, confidence, quality,

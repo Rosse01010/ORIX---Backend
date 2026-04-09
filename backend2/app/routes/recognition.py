@@ -80,27 +80,10 @@ async def _search_person(
     """
     Search across ALL embeddings for ALL persons.
     Returns the person with the highest cosine similarity match.
+    Uses numpy cosine similarity (pgvector fallback mode).
     """
-    vec_str = "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
-    result = await db.execute(
-        text("""
-            SELECT
-                p.id::text   AS person_id,
-                p.name       AS name,
-                MAX(1 - (pe.embedding <=> :vec::vector)) AS best_sim
-            FROM person_embeddings pe
-            JOIN persons p ON p.id = pe.person_id
-            WHERE p.active = true
-            GROUP BY p.id, p.name
-            ORDER BY best_sim DESC
-            LIMIT 1
-        """),
-        {"vec": vec_str},
-    )
-    row = result.first()
-    if row and row.best_sim >= settings.similarity_threshold:
-        return row.person_id, row.name, float(row.best_sim)
-    return None, "Unknown", 0.0
+    from utils.vector_search import search_best_async
+    return await search_best_async(db, embedding, settings.similarity_threshold)
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -221,9 +204,10 @@ async def register_person(
         angle_hint = angle_hint_from_yaw(yaw)
         embedding = embedder.embed(face.crop)
 
+        import json as _json
         db.add(PersonEmbedding(
             person_id=person.id,
-            embedding=embedding,
+            embedding_vec=_json.dumps(embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)),
             angle_hint=angle_hint,
             quality_score=quality,
         ))
@@ -283,9 +267,10 @@ async def add_photos(
         angle_hint = angle_hint_from_yaw(yaw)
         embedding = embedder.embed(face.crop)
 
+        import json as _json
         db.add(PersonEmbedding(
             person_id=person.id,
-            embedding=embedding,
+            embedding_vec=_json.dumps(embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)),
             angle_hint=angle_hint,
             quality_score=quality,
         ))

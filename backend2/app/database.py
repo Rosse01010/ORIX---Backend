@@ -1,12 +1,13 @@
 """
-Async SQLAlchemy engine + session factory with pgvector support.
+Async SQLAlchemy engine + session factory.
+Detects pgvector availability at startup and switches to fallback mode.
 """
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from pgvector.sqlalchemy import Vector  # noqa: F401  – registers type
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -16,10 +17,14 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.config import settings
 
-# ── Engine ─────────────────────────────────────────────────────────────────────
+log = logging.getLogger(__name__)
+
+# Global flag — set to False when pgvector is not installed
+PGVECTOR_AVAILABLE = True
+
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.app_env == "development",
+    echo=False,
     pool_size=10,
     max_overflow=20,
     pool_pre_ping=True,
@@ -38,7 +43,6 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── Dependency ─────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
@@ -51,7 +55,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def get_db_dep() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency (use with Depends)."""
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -61,14 +64,32 @@ async def get_db_dep() -> AsyncGenerator[AsyncSession, None]:
             raise
 
 
-# ── Init DB ────────────────────────────────────────────────────────────────────
 async def init_db() -> None:
-    """Create tables and enable pgvector extension."""
+    global PGVECTOR_AVAILABLE
+    from sqlalchemy import text
+
     async with engine.begin() as conn:
-        await conn.execute(
-            __import__("sqlalchemy", fromlist=["text"]).text(
-                "CREATE EXTENSION IF NOT EXISTS vector"
+        # Try enabling pgvector
+        try:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            PGVECTOR_AVAILABLE = True
+            log.info("pgvector extension enabled")
+        except Exception:
+            PGVECTOR_AVAILABLE = False
+            log.warning(
+                "pgvector not available — running in fallback mode "
+                "(embeddings stored as JSON, similarity computed in Python)"
             )
-        )
-        from app import models  # noqa: F401 – ensure models are registered
+
+        try:
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+        except Exception:
+            pass
+
+    # Import models AFTER deciding PGVECTOR_AVAILABLE
+    from app import models  # noqa: F401
+
+    async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    log.info("Database tables ready")

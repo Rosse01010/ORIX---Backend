@@ -66,9 +66,10 @@ async def confirm_identity(
     if len(body.embedding) != 512:
         raise HTTPException(status_code=422, detail="Embedding must be 512-dimensional")
 
+    import json as _json
     db.add(PersonEmbedding(
         person_id=person.id,
-        embedding=body.embedding,
+        embedding_vec=_json.dumps(body.embedding),
         angle_hint=body.angle_hint,
         quality_score=body.quality_score,
     ))
