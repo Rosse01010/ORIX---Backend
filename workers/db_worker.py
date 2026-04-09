@@ -1,12 +1,15 @@
 """
 db_worker.py
 ────────────
-Consumes vectors from stream:vectors, searches pgvector across ALL embeddings
-grouped by person, logs detections, and publishes events to stream:events.
+Consumes vectors from stream:vectors, searches for matches across ALL
+embeddings grouped by person, logs detections, and publishes events to
+stream:events.
 
-When a face is unknown OR not clearly frontal (|yaw| > 30°), the event
-includes a `candidates` list with the top-5 closest persons so the
-frontend can show a similarity panel for manual confirmation.
+Similarity thresholds (ArcFace cosine similarity, Deng et al. CVPR 2019):
+  ≥ settings.similarity_threshold  → auto-identify
+  settings.candidate_min_sim – threshold → uncertain, show candidate panel
+  |yaw| > settings.candidate_yaw_threshold → show panel even if "recognised"
+    (off-axis false accepts are a known failure mode per VGGFace2 paper)
 """
 from __future__ import annotations
 
@@ -30,13 +33,6 @@ log = get_logger(__name__)
 
 CONSUMER_GROUP = "db_workers"
 CONSUMER_NAME  = "db_worker_0"
-
-# If |yaw| is above this, include candidates even if recognized
-CANDIDATE_YAW_THRESHOLD = 30.0
-# How many candidates to return in the panel
-TOP_K_CANDIDATES = 5
-# Minimum similarity to appear as a candidate (very permissive)
-MIN_CANDIDATE_SIM = 0.20
 
 _running = True
 
@@ -63,16 +59,25 @@ def _sync_db_url(url: str) -> str:
 
 
 def _search_best(conn, embedding: List[float]) -> Tuple[Optional[str], str, float]:
-    """Best single match across all embeddings using numpy cosine similarity."""
+    """Best single match using numpy cosine similarity (ArcFace metric)."""
     from app.utils.vector_search import search_best_sync
-    return search_best_sync(conn, embedding, settings.similarity_threshold,
-                            MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
+    return search_best_sync(
+        conn,
+        embedding,
+        settings.similarity_threshold,
+        settings.candidate_min_sim,
+    )
 
 
 def _search_candidates(conn, embedding: List[float]) -> List[Dict[str, Any]]:
     """Top-K candidate persons for the similarity panel."""
     from app.utils.vector_search import search_candidates_sync
-    return search_candidates_sync(conn, embedding, MIN_CANDIDATE_SIM, TOP_K_CANDIDATES)
+    return search_candidates_sync(
+        conn,
+        embedding,
+        settings.candidate_min_sim,
+        top_k=5,
+    )
 
 
 def _log_detection(conn, person_id, camera_id, confidence, quality,
@@ -100,7 +105,12 @@ def _log_detection(conn, person_id, camera_id, confidence, quality,
 
 def run() -> None:
     configure_logging(settings.worker_log_level)
-    log.info("db_worker_start")
+    log.info(
+        "db_worker_start",
+        similarity_threshold=settings.similarity_threshold,
+        candidate_min_sim=settings.candidate_min_sim,
+        candidate_yaw_threshold=settings.candidate_yaw_threshold,
+    )
 
     rc     = redis.from_url(settings.redis_url, decode_responses=True)
     in_s   = settings.stream_vectors
@@ -145,7 +155,7 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
 
     try:
         faces: List[Dict] = json.loads(faces_json)
-        bboxes: List[Dict]     = []
+        bboxes: List[Dict]          = []
         candidates_list: List[Dict] = []
 
         for idx, face in enumerate(faces):
@@ -164,29 +174,48 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
             _log_detection(conn, person_id, camera_id, confidence,
                            quality, bbox, yaw, pitch, roll, timestamp)
 
+            # ── Confidence tier classification ─────────────────────────────
+            # Based on ArcFace cosine similarity distributions:
+            #   ≥ 0.55 → high confidence
+            #   0.40–0.54 → moderate (flag for operator)
+            #   0.30–0.39 → low (always show candidates)
+            if name != "Unknown" and similarity >= 0.55:
+                confidence_tier = "high"
+            elif name != "Unknown" and similarity >= settings.similarity_threshold:
+                confidence_tier = "moderate"
+            else:
+                confidence_tier = "low"
+
             bbox_out = {
                 "x": int(bbox[0]), "y": int(bbox[1]),
                 "width": int(bbox[2]), "height": int(bbox[3]),
                 "name": name,
                 "confidence": round(confidence, 4),
+                "confidence_tier": confidence_tier,
                 "quality": round(quality, 3),
                 "angle": angle_hint,
                 "face_index": idx,
             }
             bboxes.append(bbox_out)
 
-            # ── Candidates panel trigger ──────────────────────────────
-            # Show candidates when: face is unknown OR angle is off-axis
-            is_unknown  = name == "Unknown"
-            is_off_axis = abs(yaw) > CANDIDATE_YAW_THRESHOLD
+            # ── Candidate panel trigger ────────────────────────────────────
+            # Show panel when:
+            #   (a) face is Unknown (no match above threshold)
+            #   (b) match is "moderate" confidence (0.40–0.54)
+            #   (c) yaw is large enough to risk off-axis false accept
+            #       (VGGFace2: front-to-profile drops ~15–20% similarity)
+            is_unknown    = name == "Unknown"
+            is_moderate   = confidence_tier == "moderate"
+            is_off_axis   = abs(yaw) > settings.candidate_yaw_threshold
 
-            if is_unknown or is_off_axis:
+            if is_unknown or is_moderate or is_off_axis:
                 candidates = _search_candidates(conn, embedding)
                 if candidates:
                     candidates_list.append({
                         "face_index": idx,
                         "bbox": bbox_out,
                         "is_unknown": is_unknown,
+                        "confidence_tier": confidence_tier,
                         "yaw": round(yaw, 1),
                         "top_matches": candidates,
                     })
@@ -196,12 +225,16 @@ def _process(rc, conn, out_stream, in_stream, msg_id, fields) -> None:
                 "camera": camera_id,
                 "timestamp": timestamp,
                 "bboxes": bboxes,
-                "candidates": candidates_list,   # [] when all faces identified frontally
+                "candidates": candidates_list,
             }
             rc.xadd(out_stream, {"payload": json.dumps(event_payload)},
                     maxlen=settings.stream_max_len, approximate=True)
-            log.debug("db_worker_published", camera=camera_id, faces=len(bboxes),
-                      candidates=len(candidates_list))
+            log.debug(
+                "db_worker_published",
+                camera=camera_id,
+                faces=len(bboxes),
+                candidates=len(candidates_list),
+            )
 
     except Exception as exc:
         log.warning("db_worker_msg_error", msg_id=msg_id, error=str(exc))

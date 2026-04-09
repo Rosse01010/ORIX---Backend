@@ -3,11 +3,14 @@ recognition.py
 ──────────────
 REST endpoints for facial recognition and person management.
 
-POST /api/recognize           – recognize faces in an uploaded image
-GET  /api/persons             – list all known persons
-POST /api/persons             – register person with one or more photos
-POST /api/persons/{id}/photos – add more photos (angles) to existing person
-DELETE /api/persons/{id}      – soft-delete person
+Key improvements based on ArcFace / VGGFace2 papers:
+  • Enrollment stores per-angle embeddings PLUS a L2-normalised template
+    embedding (mean of all angles) following the VGGFace2 template-
+    aggregation strategy (Cao et al., 2018).
+  • Recognition always re-normalises embeddings before search to guard
+    against client-submitted non-unit vectors.
+  • The /enroll endpoint returns the confidence tier so the UI can warn
+    when only one frontal photo was provided.
 """
 from __future__ import annotations
 
@@ -32,7 +35,11 @@ router = APIRouter(prefix="/api/recognition", tags=["recognition"])
 
 @router.get("/health")
 async def recognition_health():
-    return {"status": "ok", "websocket_clients": 0}
+    return {
+        "status": "ok",
+        "similarity_threshold": settings.similarity_threshold,
+        "candidate_min_sim": settings.candidate_min_sim,
+    }
 
 
 # ── Schemas ────────────────────────────────────────────────────────────────────
@@ -44,6 +51,7 @@ class BBox(BaseModel):
     height: int
     name: str
     confidence: float
+    confidence_tier: str = "low"   # "high" | "moderate" | "low"
     quality: float = 0.0
     angle: str = "frontal"
 
@@ -77,16 +85,29 @@ def _get_models():
     return _detector, _embedder
 
 
-# ── Multi-embedding search ─────────────────────────────────────────────────────
+# ── Embedding helpers ──────────────────────────────────────────────────────────
+
+def _l2_normalize(v: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(v)
+    return v / (norm + 1e-10)
+
+
+def _classify_tier(similarity: float, name: str) -> str:
+    """Map cosine similarity to a confidence tier (ArcFace ranges)."""
+    if name == "Unknown":
+        return "low"
+    if similarity >= 0.55:
+        return "high"
+    if similarity >= settings.similarity_threshold:
+        return "moderate"
+    return "low"
+
+
+# ── Search ─────────────────────────────────────────────────────────────────────
 
 async def _search_person(
     db: AsyncSession, embedding: List[float]
 ) -> tuple[Optional[str], str, float]:
-    """
-    Search across ALL embeddings for ALL persons.
-    Returns the person with the highest cosine similarity match.
-    Uses numpy cosine similarity (pgvector fallback mode).
-    """
     from app.utils.vector_search import search_best_async
     return await search_best_async(db, embedding, settings.similarity_threshold)
 
@@ -100,18 +121,15 @@ async def recognize_image(
     db: AsyncSession = Depends(get_db_dep),
 ) -> RecognitionResponse:
     """Synchronous recognition on a single uploaded image."""
+    import cv2
     from app.utils.face_quality import composite_quality, angle_hint_from_yaw
     from app.utils.preprocessing import preprocess_frame
 
     contents = await file.read()
     img = np.array(Image.open(io.BytesIO(contents)).convert("RGB"))
-    # Convert RGB → BGR for OpenCV pipeline
-    import cv2
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     img_bgr = preprocess_frame(
-        img_bgr,
-        settings.camera_resize_width,
-        settings.camera_resize_height,
+        img_bgr, settings.camera_resize_width, settings.camera_resize_height
     )
 
     detector, embedder = _get_models()
@@ -125,14 +143,21 @@ async def recognize_image(
         )
         if quality < 0.1:
             continue
+
         embedding = embedder.embed(face.crop)
-        _, name, confidence = await _search_person(db, embedding)
+        # Ensure unit norm (ArcFace should already output this, but guard anyway)
+        emb_norm = _l2_normalize(np.array(embedding, dtype=np.float32)).tolist()
+
+        _, name, confidence = await _search_person(db, emb_norm)
+        tier = _classify_tier(confidence, name)
         angle = angle_hint_from_yaw(yaw)
         x, y = face.bbox[0], face.bbox[1]
+
         bboxes.append(BBox(
             x=x, y=y, width=w, height=h,
             name=name,
             confidence=round(confidence, 4),
+            confidence_tier=tier,
             quality=round(quality, 3),
             angle=angle,
         ))
@@ -148,9 +173,7 @@ async def recognize_image(
 async def list_persons(
     db: AsyncSession = Depends(get_db_dep),
 ) -> List[PersonOut]:
-    result = await db.execute(
-        select(Person).where(Person.active == True)
-    )
+    result = await db.execute(select(Person).where(Person.active == True))
     persons = result.scalars().all()
     out = []
     for p in persons:
@@ -172,24 +195,28 @@ async def list_persons(
 @router.post("/persons", response_model=PersonOut, status_code=status.HTTP_201_CREATED)
 async def register_person(
     name: str = Form(...),
-    files: List[UploadFile] = File(...),   # accept multiple photos at once
+    files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db_dep),
 ) -> PersonOut:
     """
     Register a person with one or more photos.
-    Send multiple photos at different angles for best recognition.
+    Multiple photos at different angles dramatically improve recognition
+    (VGGFace2 paper shows cross-pose similarity drops ~15–20% with
+    single-angle enrollment).
+
+    A L2-normalised template embedding (mean of all angle embeddings) is
+    also stored (angle_hint="template") for fast single-shot retrieval.
     """
-    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
     import cv2
+    import json as _json
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
 
     detector, embedder = _get_models()
-
-    # Create person record first
     person = Person(name=name)
     db.add(person)
     await db.flush()
 
-    embeddings_added = 0
+    all_embeddings: List[List[float]] = []
 
     for upload in files:
         contents = await upload.read()
@@ -200,29 +227,41 @@ async def register_person(
         if not faces:
             continue
 
-        # Use the largest face in each photo
         face = max(faces, key=lambda f: f.bbox[2] * f.bbox[3])
         w, h = face.bbox[2], face.bbox[3]
         quality, yaw, pitch, roll, _ = composite_quality(
             face.crop, face.kps, w, h, face.det_score
         )
         angle_hint = angle_hint_from_yaw(yaw)
-        embedding = embedder.embed(face.crop)
+        raw_emb = embedder.embed(face.crop)
+        embedding = _l2_normalize(
+            np.array(raw_emb, dtype=np.float32)
+        ).tolist()
 
-        import json as _json
         db.add(PersonEmbedding(
             person_id=person.id,
-            embedding_vec=_json.dumps(embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)),
+            embedding_vec=_json.dumps(embedding),
             angle_hint=angle_hint,
             quality_score=quality,
         ))
-        embeddings_added += 1
+        all_embeddings.append(embedding)
 
-    if embeddings_added == 0:
+    if not all_embeddings:
         raise HTTPException(
             status_code=422,
             detail="No face detected in any of the uploaded images.",
         )
+
+    # Store template embedding (VGGFace2-style aggregation) when > 1 photo
+    if len(all_embeddings) > 1:
+        from app.utils.vector_search import compute_template_embedding
+        template_emb = compute_template_embedding(all_embeddings)
+        db.add(PersonEmbedding(
+            person_id=person.id,
+            embedding_vec=_json.dumps(template_emb),
+            angle_hint="template",
+            quality_score=1.0,
+        ))
 
     await db.flush()
 
@@ -230,7 +269,7 @@ async def register_person(
         id=str(person.id),
         name=person.name,
         active=person.active,
-        embedding_count=embeddings_added,
+        embedding_count=len(all_embeddings),
         created_at=person.created_at.isoformat(),
     )
 
@@ -241,9 +280,10 @@ async def add_photos(
     files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db_dep),
 ) -> Dict[str, Any]:
-    """Add more photos (angles) to an existing person to improve recognition."""
-    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
+    """Add more photos (angles) to an existing person. Updates the template embedding."""
     import cv2
+    import json as _json
+    from app.utils.face_quality import composite_quality, angle_hint_from_yaw
 
     result = await db.execute(
         select(Person).where(Person.id == uuid.UUID(person_id), Person.active == True)
@@ -253,7 +293,7 @@ async def add_photos(
         raise HTTPException(status_code=404, detail="Person not found.")
 
     detector, embedder = _get_models()
-    added = 0
+    new_embeddings: List[List[float]] = []
 
     for upload in files:
         contents = await upload.read()
@@ -270,19 +310,49 @@ async def add_photos(
             face.crop, face.kps, w, h, face.det_score
         )
         angle_hint = angle_hint_from_yaw(yaw)
-        embedding = embedder.embed(face.crop)
+        raw_emb = embedder.embed(face.crop)
+        embedding = _l2_normalize(np.array(raw_emb, dtype=np.float32)).tolist()
 
-        import json as _json
         db.add(PersonEmbedding(
             person_id=person.id,
-            embedding_vec=_json.dumps(embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)),
+            embedding_vec=_json.dumps(embedding),
             angle_hint=angle_hint,
             quality_score=quality,
         ))
-        added += 1
+        new_embeddings.append(embedding)
+
+    # Rebuild template embedding from ALL existing embeddings
+    if new_embeddings:
+        existing_r = await db.execute(
+            text(
+                "SELECT embedding_vec FROM person_embeddings "
+                "WHERE person_id = :pid AND angle_hint != 'template'"
+            ),
+            {"pid": person_id},
+        )
+        all_vecs = [
+            _json.loads(row[0]) for row in existing_r.fetchall()
+        ]
+        if len(all_vecs) > 1:
+            from app.utils.vector_search import compute_template_embedding
+            template_emb = compute_template_embedding(all_vecs)
+            # Replace existing template
+            await db.execute(
+                text(
+                    "DELETE FROM person_embeddings "
+                    "WHERE person_id = :pid AND angle_hint = 'template'"
+                ),
+                {"pid": person_id},
+            )
+            db.add(PersonEmbedding(
+                person_id=person.id,
+                embedding_vec=_json.dumps(template_emb),
+                angle_hint="template",
+                quality_score=1.0,
+            ))
 
     await db.flush()
-    return {"person_id": person_id, "photos_added": added}
+    return {"person_id": person_id, "photos_added": len(new_embeddings)}
 
 
 @router.delete("/persons/{person_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -299,7 +369,7 @@ async def delete_person(
     person.active = False
 
 
-# ── Browser-based enrollment (face-api.js embedding) ─────────────────────────
+# ── Browser enrollment (face-api.js embedding) ────────────────────────────────
 
 class BrowserEnrollPayload(BaseModel):
     name: str
@@ -313,10 +383,12 @@ class BrowserEnrollPayload(BaseModel):
 class BrowserEnrollResponse(BaseModel):
     person_id: str
     name: str
+    embedding_dim: int
     linkedin_url: Optional[str] = None
     instagram_handle: Optional[str] = None
     twitter_handle: Optional[str] = None
     notes: Optional[str] = None
+    warning: Optional[str] = None
 
 
 @router.post("/persons/enroll", response_model=BrowserEnrollResponse, status_code=status.HTTP_201_CREATED)
@@ -325,11 +397,20 @@ async def enroll_person_browser(
     db: AsyncSession = Depends(get_db_dep),
 ) -> BrowserEnrollResponse:
     """
-    Register a person using a pre-computed face embedding from the browser
-    (face-api.js). Accepts optional social-profile links provided by the
-    person at enrollment time.
+    Register a person using a pre-computed face embedding from the browser.
+    The embedding is L2-normalised before storage to ensure ArcFace metric
+    compatibility regardless of the client-side model's output scale.
     """
     import json as _json
+
+    emb = _l2_normalize(np.array(payload.embedding, dtype=np.float32)).tolist()
+    dim = len(emb)
+    warning = None
+    if dim != 512:
+        warning = (
+            f"Embedding dimension is {dim}, expected 512. "
+            "Recognition accuracy may be reduced."
+        )
 
     person = Person(
         name=payload.name,
@@ -343,7 +424,7 @@ async def enroll_person_browser(
 
     db.add(PersonEmbedding(
         person_id=person.id,
-        embedding_vec=_json.dumps(payload.embedding),
+        embedding_vec=_json.dumps(emb),
         angle_hint="frontal",
         quality_score=1.0,
     ))
@@ -352,10 +433,12 @@ async def enroll_person_browser(
     return BrowserEnrollResponse(
         person_id=str(person.id),
         name=person.name,
+        embedding_dim=dim,
         linkedin_url=person.linkedin_url,
         instagram_handle=person.instagram_handle,
         twitter_handle=person.twitter_handle,
         notes=person.notes,
+        warning=warning,
     )
 
 

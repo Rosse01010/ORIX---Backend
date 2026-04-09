@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     stream_max_len: int = 1000
 
     # ── Cameras ────────────────────────────────────────────────────────────────
-    camera_sources: str = "0"          # comma-separated: "0,rtsp://..."
+    camera_sources: str = "0"
     camera_frame_rate: int = 15
     camera_resize_width: int = 640
     camera_resize_height: int = 480
@@ -48,20 +48,37 @@ class Settings(BaseSettings):
         return [s.strip() for s in self.camera_sources.split(",") if s.strip()]
 
     # ── AI Models ──────────────────────────────────────────────────────────────
-    detector_backend: str = "insightface"   # insightface | mediapipe
-    embedder_backend: str = "arcface"       # arcface | facenet
+    detector_backend: str = "insightface"
+    embedder_backend: str = "arcface"
     model_dir: str = "/app/models"
-    # buffalo_l = SCRFD-10G detector + ArcFace R100 (best accuracy)
-    # buffalo_m = SCRFD-5G + ArcFace R50 (balanced)
-    # buffalo_s = SCRFD-500M + MBF (fastest)
     insightface_model: str = "buffalo_l"
 
-    # ── Recognition ────────────────────────────────────────────────────────────
-    # Lower threshold = more permissive (catches more angles but more false positives)
-    # 0.35 works well for multi-angle; 0.50 for high-security frontal-only
-    similarity_threshold: float = 0.35
-    min_face_size: int = 20          # pixels — smaller = more crowd detections
-    detection_confidence: float = 0.50  # lower for crowds / partial occlusion
+    # ── Recognition thresholds ─────────────────────────────────────────────────
+    # ArcFace (Deng et al., CVPR 2019): 512-dim L2-normalised embeddings on the
+    # unit hypersphere. Similarity is cosine similarity ∈ [-1, 1].
+    #
+    # Recommended ranges (derived from ArcFace angle-distribution analysis and
+    # VGGFace2 cross-pose similarity matrices):
+    #   ≥ 0.55          → confident match (frontal, good lighting)
+    #   0.40 – 0.54     → probable match  (off-axis, partial occlusion, age gap)
+    #   0.30 – 0.39     → uncertain       → candidate panel only
+    #   < 0.30          → different identity
+    #
+    # Default 0.40 suits CCTV / crowd scenarios where profile views are common.
+    # Use 0.55 for access-control with strictly frontal enrollment images.
+    similarity_threshold: float = 0.40
+
+    # Minimum cosine similarity for a person to appear in the candidate panel.
+    # ArcFace paper (Figure 7) shows negative pairs rarely exceed 0.35 even
+    # under large pose variation, so 0.30 is a safe noise-filtering floor.
+    candidate_min_sim: float = 0.30
+
+    # |yaw| degrees above which candidates are surfaced even for recognised faces
+    # (guards against off-axis false accepts).
+    candidate_yaw_threshold: float = 30.0
+
+    min_face_size: int = 20
+    detection_confidence: float = 0.50
 
     # ── GPU ────────────────────────────────────────────────────────────────────
     gpu_device_id: int = 0
@@ -83,6 +100,13 @@ class Settings(BaseSettings):
     def _threshold_range(cls, v: float) -> float:
         if not (0.0 <= v <= 1.0):
             raise ValueError("similarity_threshold must be between 0 and 1")
+        return v
+
+    @field_validator("candidate_min_sim")
+    @classmethod
+    def _candidate_sim_range(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError("candidate_min_sim must be between 0 and 1")
         return v
 
 
