@@ -108,6 +108,14 @@ class Settings(BaseSettings):
     osint_default_top_k: int = 10
     osint_local_dataset_dir: str = "/app/datasets"
 
+    # ── OSINT Graph (Level 2 — identity intelligence) ────────────────────────
+    graph_mode: str = "enabled"
+    graph_cluster_same_threshold: float = 0.85
+    graph_cluster_merge_threshold: float = 0.70
+    neo4j_url: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "password"
+
     # ── Workers ────────────────────────────────────────────────────────────────
     gpu_worker_batch_size: int = 4
     gpu_worker_timeout_ms: int = 100

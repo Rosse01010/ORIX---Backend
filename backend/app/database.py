@@ -88,6 +88,7 @@ async def init_db() -> None:
 
     # Import models AFTER deciding PGVECTOR_AVAILABLE
     from app import models  # noqa: F401
+    from app.osint_graph.models import orm as graph_models  # noqa: F401
 
     # Conditionally import OSINT models so the audit table gets created
     from app.config import settings as _cfg

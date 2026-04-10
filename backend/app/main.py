@@ -23,6 +23,7 @@ from app.routes import auth as auth_router
 from app.routes import cameras as cameras_router
 from app.routes import users as users_router
 from app.routes import candidates as candidates_router
+from app.osint_graph.api import graph_routes as osint_graph_router
 from app.seed import seed_all
 from app.websocket.manager import manager
 from app.websocket.notifications import relay_events_task
@@ -99,6 +100,7 @@ app.include_router(auth_router.router)
 app.include_router(cameras_router.router)
 app.include_router(users_router.router)
 app.include_router(candidates_router.router)
+app.include_router(osint_graph_router.router)
 
 # ── OSINT subsystem (conditionally loaded) ────────────────────────────────────
 if settings.osint_enabled:
